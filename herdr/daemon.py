@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Mirror agent terminal titles onto herdr tab labels."""
 
+import fcntl
 import json
 import os
 import subprocess
@@ -40,25 +41,21 @@ def plan_renames(agents, current_labels):
 
 
 def acquire_lock(lock_path):
-    """Write our pid to lock_path; False if a live process already holds it."""
-    pid = None
-    try:
-        with open(lock_path) as fh:
-            pid = int(fh.read().strip())
-    except (FileNotFoundError, ValueError):
-        pass
-    if pid is not None:
-        try:
-            os.kill(pid, 0)
-            return False
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            return False
+    """Locked file object, or None if another live daemon holds the lock.
+
+    The caller must keep the returned object referenced for the daemon's
+    lifetime; the kernel releases the lock when the process exits.
+    """
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    with open(lock_path, "w") as fh:
-        fh.write(str(os.getpid()))
-    return True
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
 
 
 def herdr_bin():
@@ -75,20 +72,26 @@ def log(message):
     print(message, flush=True)
 
 
+def _herdr(run, bin_path, *args):
+    return run([bin_path, *args], capture_output=True, text=True, timeout=10)
+
+
+def _herdr_or_raise(run, bin_path, *args):
+    proc = _herdr(run, bin_path, *args)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "%s failed" % " ".join(args))
+    return proc.stdout
+
+
 def run_cycle(bin_path, run=subprocess.run):
-    agents_proc = run([bin_path, "agent", "list"], capture_output=True, text=True, timeout=10)
-    if agents_proc.returncode != 0:
-        raise RuntimeError(agents_proc.stderr.strip() or "agent list failed")
-    tabs_proc = run([bin_path, "tab", "list"], capture_output=True, text=True, timeout=10)
-    if tabs_proc.returncode != 0:
-        raise RuntimeError(tabs_proc.stderr.strip() or "tab list failed")
-    agents = parse_agents(agents_proc.stdout)
-    labels = parse_tabs(tabs_proc.stdout)
+    agents = parse_agents(_herdr_or_raise(run, bin_path, "agent", "list"))
+    labels = parse_tabs(_herdr_or_raise(run, bin_path, "tab", "list"))
     for tab_id, title in plan_renames(agents, labels):
-        result = run(
-            [bin_path, "tab", "rename", tab_id, title],
-            capture_output=True, text=True, timeout=10,
-        )
+        try:
+            result = _herdr(run, bin_path, "tab", "rename", tab_id, title)
+        except subprocess.TimeoutExpired as exc:
+            log("rename failed for %s: %s" % (tab_id, exc))
+            continue
         if result.returncode == 0:
             log("renamed %s -> %r" % (tab_id, title))
         else:
@@ -96,8 +99,8 @@ def run_cycle(bin_path, run=subprocess.run):
 
 
 def main():
-    lock_path = os.path.join(state_dir(), "daemon.pid")
-    if not acquire_lock(lock_path):
+    lock = acquire_lock(os.path.join(state_dir(), "daemon.pid"))
+    if lock is None:
         log("title-sync daemon already running, exiting")
         return 0
     bin_path = herdr_bin()

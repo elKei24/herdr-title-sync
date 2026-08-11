@@ -1,7 +1,9 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from herdr.daemon import (
     acquire_lock,
@@ -88,46 +90,40 @@ class ParseTabsTest(unittest.TestCase):
 
 
 class AcquireLockTest(unittest.TestCase):
-    def test_acquires_when_no_lockfile(self):
+    def test_acquires_and_writes_pid(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "sub", "daemon.pid")
-            self.assertTrue(acquire_lock(path))
+            lock = acquire_lock(path)
+            self.assertIsNotNone(lock)
             with open(path) as fh:
                 self.assertEqual(int(fh.read()), os.getpid())
+            lock.close()
 
-    def test_refuses_when_live_pid_holds_lock(self):
+    def test_second_acquire_fails_while_held(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "daemon.pid")
-            with open(path, "w") as fh:
-                fh.write(str(os.getpid()))  # this test process is alive
-            self.assertFalse(acquire_lock(path))
+            lock = acquire_lock(path)
+            self.assertIsNotNone(lock)
+            self.assertIsNone(acquire_lock(path))
+            lock.close()
 
-    def test_steals_lock_from_dead_pid(self):
+    def test_reacquires_after_release(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "daemon.pid")
-            with open(path, "w") as fh:
-                fh.write("999999999")
-            self.assertTrue(acquire_lock(path))
-
-    def test_steals_lock_with_garbage_content(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "daemon.pid")
-            with open(path, "w") as fh:
-                fh.write("not-a-pid")
-            self.assertTrue(acquire_lock(path))
+            acquire_lock(path).close()
+            second = acquire_lock(path)
+            self.assertIsNotNone(second)
+            second.close()
 
 
-class FakeProc:
-    def __init__(self, returncode=0, stdout="", stderr=""):
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
+def proc(returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
 
 def fake_run(script):
     """Returns a subprocess.run stand-in reading responses from `script`.
 
-    `script` maps a command tuple to a FakeProc. Records calls in .calls.
+    `script` maps a command tuple to a CompletedProcess. Records calls in .calls.
     """
     def run(argv, **kwargs):
         run.calls.append(tuple(argv))
@@ -148,82 +144,80 @@ def tab_list_json(labels):
 
 class RunCycleTest(unittest.TestCase):
     def test_renames_tab_whose_label_differs(self):
+        # also covers manual renames: any label != title is overwritten
         run = fake_run({
-            ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
-            ("herdr", "tab", "list"): FakeProc(stdout=tab_list_json({"w1:t1": "1"})),
-            ("herdr", "tab", "rename", "w1:t1", "Fix bug"): FakeProc(),
-        })
-        run_cycle("herdr", run=run)
-        self.assertIn(("herdr", "tab", "rename", "w1:t1", "Fix bug"), run.calls)
-
-    def test_overwrites_manual_rename_even_when_title_unchanged(self):
-        run = fake_run({
-            ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
-            ("herdr", "tab", "list"): FakeProc(stdout=tab_list_json({"w1:t1": "my manual label"})),
-            ("herdr", "tab", "rename", "w1:t1", "Fix bug"): FakeProc(),
+            ("herdr", "agent", "list"): proc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "list"): proc(stdout=tab_list_json({"w1:t1": "my manual label"})),
+            ("herdr", "tab", "rename", "w1:t1", "Fix bug"): proc(),
         })
         run_cycle("herdr", run=run)
         self.assertIn(("herdr", "tab", "rename", "w1:t1", "Fix bug"), run.calls)
 
     def test_failed_rename_does_not_raise(self):
         run = fake_run({
-            ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
-            ("herdr", "tab", "list"): FakeProc(stdout=tab_list_json({"w1:t1": "1"})),
-            ("herdr", "tab", "rename", "w1:t1", "Fix bug"): FakeProc(returncode=1, stderr="tab_not_found"),
+            ("herdr", "agent", "list"): proc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "list"): proc(stdout=tab_list_json({"w1:t1": "1"})),
+            ("herdr", "tab", "rename", "w1:t1", "Fix bug"): proc(returncode=1, stderr="tab_not_found"),
         })
         run_cycle("herdr", run=run)
 
     def test_failed_agent_list_raises(self):
         run = fake_run({
-            ("herdr", "agent", "list"): FakeProc(returncode=1, stderr="no server"),
+            ("herdr", "agent", "list"): proc(returncode=1, stderr="no server"),
         })
         with self.assertRaises(RuntimeError):
             run_cycle("herdr", run=run)
 
     def test_failed_tab_list_raises(self):
         run = fake_run({
-            ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
-            ("herdr", "tab", "list"): FakeProc(returncode=1, stderr="no server"),
+            ("herdr", "agent", "list"): proc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "list"): proc(returncode=1, stderr="no server"),
         })
         with self.assertRaises(RuntimeError):
             run_cycle("herdr", run=run)
 
     def test_no_rename_when_label_matches_title(self):
         run = fake_run({
-            ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
-            ("herdr", "tab", "list"): FakeProc(stdout=tab_list_json({"w1:t1": "Fix bug"})),
+            ("herdr", "agent", "list"): proc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "list"): proc(stdout=tab_list_json({"w1:t1": "Fix bug"})),
         })
         run_cycle("herdr", run=run)
         self.assertEqual(
             run.calls, [("herdr", "agent", "list"), ("herdr", "tab", "list")]
         )
 
+    def test_rename_timeout_does_not_raise(self):
+        def run(argv, **kwargs):
+            if argv[1] == "tab" and argv[2] == "rename":
+                raise subprocess.TimeoutExpired(argv, 10)
+            if argv[1:] == ["agent", "list"]:
+                return proc(stdout=agent_list_json(agent("w1:t1", "Fix bug")))
+            return proc(stdout=tab_list_json({"w1:t1": "1"}))
+
+        run_cycle("herdr", run=run)
+
 
 class EnvTest(unittest.TestCase):
     def test_herdr_bin_prefers_env(self):
-        os.environ["HERDR_BIN_PATH"] = "/opt/herdr"
-        try:
+        with mock.patch.dict(os.environ, {"HERDR_BIN_PATH": "/opt/herdr"}):
             self.assertEqual(herdr_bin(), "/opt/herdr")
-        finally:
-            del os.environ["HERDR_BIN_PATH"]
 
     def test_herdr_bin_falls_back_to_path_lookup(self):
-        os.environ.pop("HERDR_BIN_PATH", None)
-        self.assertEqual(herdr_bin(), "herdr")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_BIN_PATH", None)
+            self.assertEqual(herdr_bin(), "herdr")
 
     def test_state_dir_prefers_env(self):
-        os.environ["HERDR_PLUGIN_STATE_DIR"] = "/tmp/state"
-        try:
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_STATE_DIR": "/tmp/state"}):
             self.assertEqual(state_dir(), "/tmp/state")
-        finally:
-            del os.environ["HERDR_PLUGIN_STATE_DIR"]
 
     def test_state_dir_fallback(self):
-        os.environ.pop("HERDR_PLUGIN_STATE_DIR", None)
-        self.assertEqual(
-            state_dir(),
-            os.path.expanduser("~/.local/state/herdr/plugins/elkei24.title-sync"),
-        )
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_PLUGIN_STATE_DIR", None)
+            self.assertEqual(
+                state_dir(),
+                os.path.expanduser("~/.local/state/herdr/plugins/elkei24.title-sync"),
+            )
 
 
 if __name__ == "__main__":
