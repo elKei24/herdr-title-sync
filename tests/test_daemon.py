@@ -3,7 +3,14 @@ import os
 import tempfile
 import unittest
 
-from herdr.daemon import acquire_lock, parse_agents, plan_renames
+from herdr.daemon import (
+    acquire_lock,
+    herdr_bin,
+    parse_agents,
+    plan_renames,
+    run_cycle,
+    state_dir,
+)
 
 
 def agent(tab_id, title):
@@ -90,6 +97,92 @@ class AcquireLockTest(unittest.TestCase):
             with open(path, "w") as fh:
                 fh.write("not-a-pid")
             self.assertTrue(acquire_lock(path))
+
+
+class FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def fake_run(script):
+    """Returns a subprocess.run stand-in reading responses from `script`.
+
+    `script` maps a command tuple to a FakeProc. Records calls in .calls.
+    """
+    def run(argv, **kwargs):
+        run.calls.append(tuple(argv))
+        return script[tuple(argv)]
+
+    run.calls = []
+    return run
+
+
+def agent_list_json(*agents):
+    return json.dumps({"id": "x", "result": {"agents": list(agents), "type": "agent_list"}})
+
+
+class RunCycleTest(unittest.TestCase):
+    def test_renames_and_updates_cache(self):
+        run = fake_run({
+            ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "rename", "w1:t1", "Fix bug"): FakeProc(),
+        })
+        last_set = {}
+        run_cycle("herdr", last_set, run=run)
+        self.assertEqual(last_set, {"w1:t1": "Fix bug"})
+        self.assertIn(("herdr", "tab", "rename", "w1:t1", "Fix bug"), run.calls)
+
+    def test_failed_rename_leaves_cache_unset(self):
+        run = fake_run({
+            ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "rename", "w1:t1", "Fix bug"): FakeProc(returncode=1, stderr="tab_not_found"),
+        })
+        last_set = {}
+        run_cycle("herdr", last_set, run=run)
+        self.assertEqual(last_set, {})
+
+    def test_failed_agent_list_raises(self):
+        run = fake_run({
+            ("herdr", "agent", "list"): FakeProc(returncode=1, stderr="no server"),
+        })
+        with self.assertRaises(RuntimeError):
+            run_cycle("herdr", {}, run=run)
+
+    def test_no_rename_when_cache_current(self):
+        run = fake_run({
+            ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+        })
+        run_cycle("herdr", {"w1:t1": "Fix bug"}, run=run)
+        self.assertEqual(run.calls, [("herdr", "agent", "list")])
+
+
+class EnvTest(unittest.TestCase):
+    def test_herdr_bin_prefers_env(self):
+        os.environ["HERDR_BIN_PATH"] = "/opt/herdr"
+        try:
+            self.assertEqual(herdr_bin(), "/opt/herdr")
+        finally:
+            del os.environ["HERDR_BIN_PATH"]
+
+    def test_herdr_bin_falls_back_to_path_lookup(self):
+        os.environ.pop("HERDR_BIN_PATH", None)
+        self.assertEqual(herdr_bin(), "herdr")
+
+    def test_state_dir_prefers_env(self):
+        os.environ["HERDR_PLUGIN_STATE_DIR"] = "/tmp/state"
+        try:
+            self.assertEqual(state_dir(), "/tmp/state")
+        finally:
+            del os.environ["HERDR_PLUGIN_STATE_DIR"]
+
+    def test_state_dir_fallback(self):
+        os.environ.pop("HERDR_PLUGIN_STATE_DIR", None)
+        self.assertEqual(
+            state_dir(),
+            os.path.expanduser("~/.local/state/herdr/plugins/elkei24.title-sync"),
+        )
 
 
 if __name__ == "__main__":
