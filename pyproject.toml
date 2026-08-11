@@ -1,0 +1,5 @@
+[tool.semantic_release]
+version_toml = ["herdr-plugin.toml:version"]
+allow_zero_version = false
+commit_message = "chore(release): {version}"
+tag_format = "v{version}"
