@@ -28,7 +28,7 @@ from its agent's `terminal_title_stripped`. Details:
 herdr plugin install elKei24/herdr-title-sync
 ```
 
-Requires `python3` on `PATH` and herdr ≥ 0.8.0.
+Requires `python3` (≥ 3.9) on `PATH` and herdr ≥ 0.8.0.
 
 For local development, link a checkout instead:
 
