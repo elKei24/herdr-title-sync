@@ -7,6 +7,7 @@ from herdr.daemon import (
     acquire_lock,
     herdr_bin,
     parse_agents,
+    parse_tabs,
     plan_renames,
     run_cycle,
     state_dir,
@@ -69,6 +70,23 @@ class ParseAgentsTest(unittest.TestCase):
         self.assertEqual(parse_agents(raw), [agent("w1:t1", "X")])
 
 
+class ParseTabsTest(unittest.TestCase):
+    def test_parses_tab_list_into_label_map(self):
+        raw = json.dumps(
+            {
+                "id": "cli:tab:list",
+                "result": {
+                    "tabs": [
+                        {"tab_id": "w1:t1", "label": "1", "focused": True},
+                        {"tab_id": "w1:t2", "label": "Fix bug", "focused": False},
+                    ],
+                    "type": "tab_list",
+                },
+            }
+        )
+        self.assertEqual(parse_tabs(raw), {"w1:t1": "1", "w1:t2": "Fix bug"})
+
+
 class AcquireLockTest(unittest.TestCase):
     def test_acquires_when_no_lockfile(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -123,39 +141,62 @@ def agent_list_json(*agents):
     return json.dumps({"id": "x", "result": {"agents": list(agents), "type": "agent_list"}})
 
 
+def tab_list_json(labels):
+    tabs = [{"tab_id": tab_id, "label": label} for tab_id, label in labels.items()]
+    return json.dumps({"id": "x", "result": {"tabs": tabs, "type": "tab_list"}})
+
+
 class RunCycleTest(unittest.TestCase):
-    def test_renames_and_updates_cache(self):
+    def test_renames_tab_whose_label_differs(self):
         run = fake_run({
             ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "list"): FakeProc(stdout=tab_list_json({"w1:t1": "1"})),
             ("herdr", "tab", "rename", "w1:t1", "Fix bug"): FakeProc(),
         })
-        last_set = {}
-        run_cycle("herdr", last_set, run=run)
-        self.assertEqual(last_set, {"w1:t1": "Fix bug"})
+        run_cycle("herdr", run=run)
         self.assertIn(("herdr", "tab", "rename", "w1:t1", "Fix bug"), run.calls)
 
-    def test_failed_rename_leaves_cache_unset(self):
+    def test_overwrites_manual_rename_even_when_title_unchanged(self):
         run = fake_run({
             ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "list"): FakeProc(stdout=tab_list_json({"w1:t1": "my manual label"})),
+            ("herdr", "tab", "rename", "w1:t1", "Fix bug"): FakeProc(),
+        })
+        run_cycle("herdr", run=run)
+        self.assertIn(("herdr", "tab", "rename", "w1:t1", "Fix bug"), run.calls)
+
+    def test_failed_rename_does_not_raise(self):
+        run = fake_run({
+            ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "list"): FakeProc(stdout=tab_list_json({"w1:t1": "1"})),
             ("herdr", "tab", "rename", "w1:t1", "Fix bug"): FakeProc(returncode=1, stderr="tab_not_found"),
         })
-        last_set = {}
-        run_cycle("herdr", last_set, run=run)
-        self.assertEqual(last_set, {})
+        run_cycle("herdr", run=run)
 
     def test_failed_agent_list_raises(self):
         run = fake_run({
             ("herdr", "agent", "list"): FakeProc(returncode=1, stderr="no server"),
         })
         with self.assertRaises(RuntimeError):
-            run_cycle("herdr", {}, run=run)
+            run_cycle("herdr", run=run)
 
-    def test_no_rename_when_cache_current(self):
+    def test_failed_tab_list_raises(self):
         run = fake_run({
             ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "list"): FakeProc(returncode=1, stderr="no server"),
         })
-        run_cycle("herdr", {"w1:t1": "Fix bug"}, run=run)
-        self.assertEqual(run.calls, [("herdr", "agent", "list")])
+        with self.assertRaises(RuntimeError):
+            run_cycle("herdr", run=run)
+
+    def test_no_rename_when_label_matches_title(self):
+        run = fake_run({
+            ("herdr", "agent", "list"): FakeProc(stdout=agent_list_json(agent("w1:t1", "Fix bug"))),
+            ("herdr", "tab", "list"): FakeProc(stdout=tab_list_json({"w1:t1": "Fix bug"})),
+        })
+        run_cycle("herdr", run=run)
+        self.assertEqual(
+            run.calls, [("herdr", "agent", "list"), ("herdr", "tab", "list")]
+        )
 
 
 class EnvTest(unittest.TestCase):

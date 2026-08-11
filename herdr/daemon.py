@@ -16,11 +16,15 @@ def parse_agents(raw):
     return json.loads(raw)["result"]["agents"]
 
 
-def plan_renames(agents, last_set):
+def parse_tabs(raw):
+    return {tab["tab_id"]: tab["label"] for tab in json.loads(raw)["result"]["tabs"]}
+
+
+def plan_renames(agents, current_labels):
     """Renames to apply, as (tab_id, title) pairs.
 
     First agent with a non-empty title claims its tab; a rename is emitted
-    only when the title differs from what we last set for that tab.
+    only when the tab's current label differs from that title.
     """
     renames = []
     claimed = set()
@@ -30,7 +34,7 @@ def plan_renames(agents, last_set):
         if not tab_id or not title or tab_id in claimed:
             continue
         claimed.add(tab_id)
-        if last_set.get(tab_id) != title:
+        if current_labels.get(tab_id) != title:
             renames.append((tab_id, title))
     return renames
 
@@ -71,17 +75,21 @@ def log(message):
     print(message, flush=True)
 
 
-def run_cycle(bin_path, last_set, run=subprocess.run):
-    proc = run([bin_path, "agent", "list"], capture_output=True, text=True, timeout=10)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "agent list failed")
-    for tab_id, title in plan_renames(parse_agents(proc.stdout), last_set):
+def run_cycle(bin_path, run=subprocess.run):
+    agents_proc = run([bin_path, "agent", "list"], capture_output=True, text=True, timeout=10)
+    if agents_proc.returncode != 0:
+        raise RuntimeError(agents_proc.stderr.strip() or "agent list failed")
+    tabs_proc = run([bin_path, "tab", "list"], capture_output=True, text=True, timeout=10)
+    if tabs_proc.returncode != 0:
+        raise RuntimeError(tabs_proc.stderr.strip() or "tab list failed")
+    agents = parse_agents(agents_proc.stdout)
+    labels = parse_tabs(tabs_proc.stdout)
+    for tab_id, title in plan_renames(agents, labels):
         result = run(
             [bin_path, "tab", "rename", tab_id, title],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
-            last_set[tab_id] = title
             log("renamed %s -> %r" % (tab_id, title))
         else:
             log("rename failed for %s: %s" % (tab_id, result.stderr.strip()))
@@ -94,12 +102,11 @@ def main():
         return 0
     bin_path = herdr_bin()
     log("title-sync daemon started (pid %d)" % os.getpid())
-    last_set = {}
     failures = 0
     while True:
         time.sleep(POLL_SECONDS)
         try:
-            run_cycle(bin_path, last_set)
+            run_cycle(bin_path)
             failures = 0
         except Exception as exc:
             failures += 1
