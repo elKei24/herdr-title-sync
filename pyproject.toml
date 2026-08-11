@@ -3,3 +3,7 @@ version_toml = ["herdr-plugin.toml:version"]
 allow_zero_version = false
 commit_message = "chore(release): {version}"
 tag_format = "v{version}"
+
+[tool.semantic_release.remote]
+# Push over the checkout's SSH remote (deploy key with ruleset bypass), not token HTTPS.
+ignore_token_for_push = true
